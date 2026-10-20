@@ -1,23 +1,38 @@
 // Analiza un trabajo universitario con Google Gemini y crea la guía de micro acciones.
 // Llamada a Google Gemini con tu propia clave (variable GEMINI_API_KEY en Netlify).
-// Usa Flash y, si se alcanza el límite gratuito o falla, pasa a Flash-Lite.
-const MODELOS = [process.env.GEMINI_MODEL || "gemini-3.8-flash", "gemini-3.5-flash-lite"];
+// Usa Flash pensando poco; si tarda, se alcanza el límite gratuito o falla, pasa a Flash-Lite.
+// Netlify corta las funciones a los 30 s, así que cada intento tiene un tiempo máximo.
+const INTENTOS = [
+  { modelo: process.env.GEMINI_MODEL || "gemini-3.8-flash", pensar: "low", maxMs: 17000 },
+  { modelo: "gemini-3.5-flash-lite", maxMs: 11000 },
+];
 
 async function gemini({ sistema, mensajes, maxTokens, json: modoJSON }) {
   const clave = process.env.GEMINI_API_KEY;
   if (!clave) throw new Error("Falta la variable GEMINI_API_KEY en Netlify");
-  const cuerpo = {
-    systemInstruction: { parts: [{ text: sistema }] },
-    contents: mensajes.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })),
-    generationConfig: { maxOutputTokens: maxTokens, ...(modoJSON ? { responseMimeType: "application/json" } : {}) },
-  };
   let ultimoError;
-  for (const modelo of MODELOS) {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": clave },
-      body: JSON.stringify(cuerpo),
-    });
+  for (const { modelo, pensar, maxMs } of INTENTOS) {
+    const cuerpo = {
+      systemInstruction: { parts: [{ text: sistema }] },
+      contents: mensajes.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })),
+      generationConfig: {
+        maxOutputTokens: maxTokens,
+        ...(modoJSON ? { responseMimeType: "application/json" } : {}),
+        ...(pensar ? { thinkingConfig: { thinkingLevel: pensar } } : {}),
+      },
+    };
+    let res;
+    try {
+      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": clave },
+        body: JSON.stringify(cuerpo),
+        signal: AbortSignal.timeout(maxMs),
+      });
+    } catch (e) {
+      ultimoError = new Error(`Gemini (${modelo}) tardó demasiado`);
+      continue; // tiempo agotado: probar el siguiente modelo
+    }
     const data = await res.json().catch(() => ({}));
     if (res.ok) {
       const partes = data.candidates?.[0]?.content?.parts || [];
@@ -26,8 +41,10 @@ async function gemini({ sistema, mensajes, maxTokens, json: modoJSON }) {
       ultimoError = new Error("Gemini no devolvió texto");
       continue;
     }
-    ultimoError = new Error(`Gemini (${modelo}) error ${res.status}: ${data.error?.message || ""}`);
-    if (![404, 429, 500, 503].includes(res.status)) break;  // otros errores (p. ej. clave mala): no reintentar
+    const msg = data.error?.message || "";
+    ultimoError = new Error(`Gemini (${modelo}) error ${res.status}: ${msg}`);
+    const reintentable = [404, 429, 500, 503].includes(res.status) || (res.status === 400 && /think/i.test(msg));
+    if (!reintentable) break; // otros errores (p. ej. clave mala): no reintentar
   }
   throw ultimoError;
 }
@@ -91,43 +108,3 @@ export default async (req) => {
     body = await req.json();
   } catch {
     return json({ error: "Cuerpo de la petición no válido" }, 400);
-  }
-
-  const { contenido, fechaEntrega, nombreArchivo, notas, fuentes } = body || {};
-  if (!contenido || !fechaEntrega) {
-    return json({ error: "Faltan el contenido del trabajo o la fecha de entrega" }, 400);
-  }
-
-  const hoy = new Date().toISOString().slice(0, 10);
-  const fuentesTxt = textoFuentes(fuentes);
-
-  const mensaje = `Fecha de hoy: ${hoy}
-Fecha de entrega: ${fechaEntrega}
-Archivo: ${nombreArchivo || "sin nombre"}
-${notas ? `Notas del estudiante: ${notas}\n` : ""}
---- ENUNCIADO DEL TRABAJO ---
-${String(contenido).slice(0, MAX_CONTENIDO)}
-${fuentesTxt ? `\n=== FUENTES DE APOYO ===\n${fuentesTxt}` : ""}`;
-
-  try {
-    const salida = await gemini({
-      sistema: PROMPT_SISTEMA,
-      mensajes: [{ role: "user", content: mensaje }],
-      maxTokens: 8192,
-      json: true,
-    });
-
-    const analisis = extraerJSON(salida);
-
-    analisis.horasEstimadas = Math.max(0.5, Number(analisis.horasEstimadas) || 2);
-    analisis.dificultad = Math.min(5, Math.max(1, Math.round(Number(analisis.dificultad) || 3)));
-    analisis.fases = Array.isArray(analisis.fases) ? analisis.fases : [];
-
-    return json(analisis);
-  } catch (err) {
-    console.error(err);
-    return json({ error: "No se pudo analizar el trabajo: " + err.message }, 500);
-  }
-};
-
-export const config = { path: "/api/analizar" };
